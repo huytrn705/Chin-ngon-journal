@@ -1,1 +1,1 @@
-worker: python ducfx_journal_bot.py
+web: python ducfx_journal_bot.py

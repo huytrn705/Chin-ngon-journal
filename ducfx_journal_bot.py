@@ -4,8 +4,10 @@ DucFX Trading Journal Bot - Telegram
 Bot xử lý interactive journal: checklist, cảm xúc, tổng kết tuần.
 Chạy song song với EA MQL5 DucFX_TelegramJournal.mq5
 
+EA gửi trade data qua HTTP POST → Bot nhận, lưu, gửi journal prompt lên Telegram.
+
 Cài đặt:
-    pip install python-telegram-bot==20.7 apscheduler
+    pip install python-telegram-bot==20.7 apscheduler aiohttp
 
 Chạy:
     python ducfx_journal_bot.py
@@ -13,15 +15,18 @@ Chạy:
 Biến môi trường:
     TELEGRAM_BOT_TOKEN=your_bot_token
     TELEGRAM_CHAT_ID=your_chat_id
+    PORT=8080  (Railway tự set)
 """
 
 import os
 import json
+import asyncio
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from aiohttp import web
+from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, filters, ContextTypes
@@ -33,8 +38,12 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 # ═══════════════════════════════════════════
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID_HERE")
+PORT = int(os.getenv("PORT", "8080"))
 DATA_DIR = Path("journal_data")
 DATA_DIR.mkdir(exist_ok=True)
+
+# Global bot reference for HTTP handler to send Telegram messages
+g_bot: Bot = None
 TRADES_FILE = DATA_DIR / "trades.json"
 WEEKLY_REPORT_DAY = "sunday"  # Gửi tổng kết vào Chủ Nhật
 WEEKLY_REPORT_HOUR = 20       # 8 PM
@@ -506,34 +515,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     
-    # --- Parse TRADE_DATA from EA ---
-    if text.startswith("TRADE_DATA|"):
-        trade_data = parse_trade_data(text)
-        if trade_data:
-            trades = load_trades()
-            trades.append(trade_data)
-            save_trades(trades)
-            logger.info(f"Trade #{trade_data['ticket']} saved. Total: {len(trades)}")
-            
-            # Auto-send journal prompt
-            await update.message.reply_text(
-                f"✅ Lệnh #{trade_data['ticket']} đã lưu!\n"
-                f"Dùng /journal {trade_data['ticket']} để ghi checklist & cảm xúc.",
-                parse_mode="Markdown"
-            )
-            
-            # Check loss streak
-            recent = load_trades()[-3:]
-            losses = sum(1 for t in recent if t["pl_usd"] < 0)
-            if losses >= 2:
-                await update.message.reply_text(
-                    "🛑 *CẢNH BÁO: Thua 2+ lệnh liên tiếp!*\n"
-                    "Quy tắc 3: NGHỈ TRONG NGÀY.\n"
-                    "Tắt MT5, đi làm việc khác. 🙏",
-                    parse_mode="Markdown"
-                )
-        return
-    
     # --- Save trade note ---
     pending_ticket = context.user_data.get("pending_note_ticket")
     if pending_ticket and text != "/skip":
@@ -647,9 +628,74 @@ async def send_weekly_report(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
 
 # ═══════════════════════════════════════════
+# HTTP ENDPOINT — Nhận trade data từ EA
+# ═══════════════════════════════════════════
+async def handle_trade_post(request):
+    """EA gửi POST /trade với body = TRADE_DATA|..."""
+    global g_bot
+    try:
+        body = await request.text()
+        logger.info(f"HTTP received: {body[:80]}")
+
+        if not body.startswith("TRADE_DATA|"):
+            return web.Response(text="IGNORED", status=200)
+
+        trade_data = parse_trade_data(body)
+        if not trade_data:
+            return web.Response(text="PARSE_ERROR", status=400)
+
+        # Save trade
+        trades = load_trades()
+        trades.append(trade_data)
+        save_trades(trades)
+        logger.info(f"Trade #{trade_data['ticket']} saved. Total: {len(trades)}")
+
+        # Send journal prompt to Telegram
+        if g_bot:
+            ticket = trade_data["ticket"]
+            pl = trade_data["pl_usd"]
+            sym = trade_data["symbol"]
+            d = trade_data["direction"]
+            emoji = "✅" if pl >= 0 else "❌"
+
+            msg = (
+                f"{emoji} *Lệnh #{ticket} đã lưu!*\n"
+                f"{sym} | {d} | {pl:+.2f} USD\n\n"
+                f"📝 Dùng /journal {ticket} để ghi checklist & cảm xúc."
+            )
+            await g_bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
+
+            # Check loss streak
+            recent = trades[-3:]
+            losses = sum(1 for t in recent if t["pl_usd"] < 0)
+            if losses >= 2:
+                await g_bot.send_message(
+                    chat_id=CHAT_ID,
+                    text=(
+                        "🛑 *CẢNH BÁO: Thua 2+ lệnh liên tiếp!*\n"
+                        "Quy tắc 3: NGHỈ TRONG NGÀY.\n"
+                        "Tắt MT5, đi làm việc khác. 🙏"
+                    ),
+                    parse_mode="Markdown",
+                )
+
+        return web.Response(text="OK", status=200)
+
+    except Exception as e:
+        logger.error(f"HTTP error: {e}")
+        return web.Response(text=str(e), status=500)
+
+async def handle_health(request):
+    """Health check endpoint"""
+    trades = load_trades()
+    return web.Response(text=f"OK | {len(trades)} trades", status=200)
+
+# ═══════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════
 def main():
+    global g_bot
+
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
         print("=" * 50)
         print("⚠️  CHƯA CẤU HÌNH BOT TOKEN!")
@@ -663,12 +709,11 @@ def main():
         print("   export TELEGRAM_BOT_TOKEN='your_token'")
         print("   export TELEGRAM_CHAT_ID='your_chat_id'")
         print("5. Chạy lại: python ducfx_journal_bot.py")
-        print()
-        print("Hoặc sửa trực tiếp trong file này (dòng BOT_TOKEN, CHAT_ID)")
         return
-    
+
     app = Application.builder().token(BOT_TOKEN).build()
-    
+    g_bot = app.bot
+
     # Command handlers
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("journal", cmd_journal))
@@ -679,13 +724,13 @@ def main():
     app.add_handler(CommandHandler("rules", cmd_rules))
     app.add_handler(CommandHandler("discipline", cmd_discipline))
     app.add_handler(CommandHandler("help", cmd_start))
-    
+
     # Callback handler (inline keyboards)
     app.add_handler(CallbackQueryHandler(handle_callback))
-    
-    # Message handler (trade data from EA + notes)
+
+    # Message handler (notes from user)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
+
     # Schedule weekly report
     scheduler = AsyncIOScheduler()
     scheduler.add_job(
@@ -698,11 +743,41 @@ def main():
         misfire_grace_time=3600,
     )
     scheduler.start()
-    
+
     logger.info("🚀 DucFX Journal Bot started!")
+    logger.info(f"🌐 HTTP server on port {PORT}")
     logger.info(f"📅 Weekly report: {WEEKLY_REPORT_DAY} at {WEEKLY_REPORT_HOUR}:00")
-    
-    app.run_polling(drop_pending_updates=True)
+
+    # Run both: Telegram polling + HTTP server
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    async def run_all():
+        # Start HTTP server
+        web_app = web.Application()
+        web_app.router.add_post("/trade", handle_trade_post)
+        web_app.router.add_get("/", handle_health)
+        runner = web.AppRunner(web_app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", PORT)
+        await site.start()
+        logger.info(f"✅ HTTP listening on 0.0.0.0:{PORT}")
+
+        # Start Telegram bot
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling(drop_pending_updates=True)
+
+        # Keep running
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await app.updater.stop()
+            await app.stop()
+            await app.shutdown()
+            await runner.cleanup()
+
+    loop.run_until_complete(run_all())
 
 if __name__ == "__main__":
     main()
